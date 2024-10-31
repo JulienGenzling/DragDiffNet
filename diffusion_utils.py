@@ -669,3 +669,46 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                      )
 
     return frames, mass, L, evals, evecs, gradX, gradY
+
+def save_operators(verts, faces, n_eig, save_path):
+    """
+    See documentation for compute_operators(). This essentailly just wraps a call to compute_operators, using a cache if possible.
+    All arrays are always computed using double precision for stability, then truncated to single precision floats to store on disk, and finally returned as a tensor with dtype/device matching the `verts` input.
+    """
+
+    verts_np = toNP(verts)
+    faces_np = toNP(faces)
+
+    if(np.isnan(verts_np).any()):
+        raise RuntimeError("tried to construct operators from NaN verts")
+    
+    frames, mass, L, evals, evecs, gradX, gradY = compute_operators(verts, faces, n_eig)
+    dtype_np = np.float32
+
+    L_np = sparse_torch_to_np(L).astype(dtype_np)
+    gradX_np = sparse_torch_to_np(gradX).astype(dtype_np)
+    gradY_np = sparse_torch_to_np(gradY).astype(dtype_np)
+
+    np.savez(save_path,
+                verts=verts_np.astype(dtype_np),
+                frames=toNP(frames).astype(dtype_np),
+                faces=faces_np,
+                k_eig=n_eig,
+                mass=toNP(mass).astype(dtype_np),
+                L_data = L_np.data.astype(dtype_np),
+                L_indices = L_np.indices,
+                L_indptr = L_np.indptr,
+                L_shape = L_np.shape,
+                evals=toNP(evals).astype(dtype_np),
+                evecs=toNP(evecs).astype(dtype_np),
+                gradX_data = gradX_np.data.astype(dtype_np),
+                gradX_indices = gradX_np.indices,
+                gradX_indptr = gradX_np.indptr,
+                gradX_shape = gradX_np.shape,
+                gradY_data = gradY_np.data.astype(dtype_np),
+                gradY_indices = gradY_np.indices,
+                gradY_indptr = gradY_np.indptr,
+                gradY_shape = gradY_np.shape,
+                )
+    print("Saved operators to " + save_path)
+    return
