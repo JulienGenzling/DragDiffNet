@@ -9,7 +9,6 @@ from utils import create_fold_splits
 
 from config import Config
 
-
 torch.manual_seed(Config.seed)
 
 # Cache data
@@ -71,6 +70,7 @@ for fold in range(Config.n_folds):
         "p_out": Config.p_out,
         "N_block": Config.n_block,
         "n_channels": Config.n_channels,
+        "outputs_at": Config.outputs_at
     }
 
     my_trainer = Trainer(

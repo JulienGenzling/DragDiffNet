@@ -13,7 +13,7 @@ class Trainer(object):
     def __init__(self, diffusionnet_cls, model_cfg, train_loader, valid_loader, device='cuda',
                  lr=1e-3, weight_decay=1e-4, num_epochs=200,
                  lr_decay_every = 50, lr_decay_rate = 0.5,
-                 log_interval=10, save_dir=None):
+                 log_interval=1, save_dir=None):
 
         """
         diffusionnet_cls: (nn.Module) class of the DiffusionNet model
@@ -32,10 +32,10 @@ class Trainer(object):
 
         # TOD build the network from the model_cfg
         self.model = diffusionnet_cls(
-            p_in=model_cfg['p_in'],
-            p_out=model_cfg['p_out'],
-            n_channels=model_cfg['n_channels'],
-            N_block=model_cfg['N_block']
+            C_in=model_cfg['p_in'],
+            C_out=model_cfg['p_out'],
+            N_block=model_cfg['N_block'],
+            outputs_at=model_cfg['outputs_at'],
         )
 
 
@@ -130,21 +130,14 @@ class Trainer(object):
             # MAYBE DO SOMETHING TO THE PREDS
 
             # COMPUTE THE LOSS
-            print(preds, label)
-            loss = self.loss(preds, label)##
+            loss = self.loss(preds, label).float()##
 
             loss.backward()
             self.optimizer.step()
 
             train_loss += loss.item()
 
-            # COMPUTE TRAINING ACCURACY
-            pred_labels = torch.argmax(preds, dim=-1)# TODO GET PREDICTED LABELS
-
-            n_correct = pred_labels.eq(label).sum().item() # number of correct predictions
-            train_acc += n_correct/label.shape[0]
-
-        return train_loss/len(self.train_loader), train_acc/len(self.train_loader)
+        return train_loss/len(self.train_loader)
 
     def valid_epoch(self):
         """
@@ -165,7 +158,7 @@ class Trainer(object):
             evecs = batch["evecs"].to(self.device)
             gradX = batch["gradX"].to(self.device)
             gradY = batch["gradY"].to(self.device)
-            labels = batch["labels"].to(self.device)
+            labels = batch["label"].to(self.device)
 
             # TODO PERFORM FORWARD STEP
             preds = self.forward_step(verts, faces, frames, vertex_area, L, evals, evecs, gradX, gradY)
@@ -176,13 +169,8 @@ class Trainer(object):
 
             val_loss += loss.item()
 
-            # Compute ACCURACCY
-            pred_labels = torch.argmax(preds, dim=-1)# TODO GET PREDICTED LABELS
-
-            n_correct = pred_labels.eq(labels).sum().item() # number of correct predictions
-            val_acc += n_correct/labels.shape[0]
         print("End val epoch")
-        return val_loss/len(self.valid_loader), val_acc/len(self.valid_loader)
+        return val_loss/len(self.valid_loader)
 
     def run(self):
         os.makedirs('./models', exist_ok=True)
@@ -192,18 +180,15 @@ class Trainer(object):
             if epoch % self.lr_decay_every == 0:
                 self.adjust_lr()
 
-            train_ep_loss, train_ep_acc = self.train_epoch()
+            train_ep_loss = self.train_epoch()
             self.train_losses.append(train_ep_loss)
-            self.train_accs.append(train_ep_acc)
 
             if epoch % self.log_interval == 0:
-                val_loss, val_acc = self.valid_epoch()
+                val_loss = self.valid_epoch()
                 torch.save(self.model.state_dict(), os.path.join(self.save_dir, 'model_latest.pth'))
                 print(f'Epoch: {epoch:03d}/{self.num_epochs}, '
                       f'Train Loss: {train_ep_loss:.4f}, '
-                      f'Train Acc: {1e2*train_ep_acc:.2f}%, '
-                      f'Val Loss: {val_loss:.4f}, '
-                      f'Val Acc: {1e2*val_acc:.2f}%')
+                      f'Val Loss: {val_loss:.4f}, ')
         torch.save(self.model.state_dict(), os.path.join(self.save_dir, 'model_final.pth'))
 
 

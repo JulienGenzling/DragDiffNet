@@ -46,15 +46,21 @@ class CarMeshDataset(Dataset):
         verts, faces, frames, mass, L, evals, evecs, gradX, gradY = get_geometry(
             cached_filepath, self.device
         )
+        possible_labels = [
+            self.all_items[idx], 
+            self.all_items[idx] + "_flip",
+            self.all_items[idx] + "_aug",
+            self.all_items[idx] + "_flip_aug"
+        ]
         label = self.label_map[
-            self.label_map["file"] == self.all_items[idx]
+            self.label_map["file"].isin(possible_labels)
         ]["Cd"].values[0]
         dict = {
             "vertices": verts,
             "faces": faces,
             "frames": frames,
             "vertex_area": mass,
-            "label": torch.tensor(label),
+            "label": torch.tensor(label, dtype=torch.float32),
             "L": L,
             "evals": evals,
             "evecs": evecs,

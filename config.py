@@ -23,6 +23,7 @@ class Config:
     p_out = 1   # Number of output features
     n_block = 4 # Number of DiffusionNetBlock
     n_channels = 128    # Width of the network
+    outputs_at = "global_mean"
 
     # Save dir
     save_dir = "/Data/tested/models"

@@ -1,262 +1,291 @@
-import torch 
+import sys
+import os
+import random
+
+import scipy
+import scipy.sparse.linalg as sla
+# ^^^ we NEED to import scipy before torch, or it crashes :(
+# (observed on Ubuntu 20.04 w/ torch 1.6.0 and scipy 1.5.2 installed via conda)
+
+import numpy as np
+import torch
 import torch.nn as nn
 
-def project_to_basis(x, evecs, vertex_areas):
+def to_basis(values, basis, massvec):
     """
-    Project an input sinal x to the spectral basis.
-
-
-    Parameters
-    -------------------
-    x            : (B, n, p) Tensor of input
-    evecs        : (B, n, K) Tensor of eigenvectors
-    vertex_areas : (B, n,) vertex areax
-
-    Output
-    -------------------
-    projected_values : (B, K, p) Tensor of coefficients in the basis
+    Transform data in to an orthonormal basis (where orthonormal is wrt to massvec)
+    Inputs:
+      - values: (B,V,D)
+      - basis: (B,V,K)
+      - massvec: (B,V)
+    Outputs:
+      - (B,K,D) transformed values
     """
-    evecsT = evecs.transpose(-2, -1)
-    a = x * vertex_areas.unsqueeze(-1)
-    return evecsT @ a
+    basisT = basis.transpose(-2, -1)
+    return torch.matmul(basisT, values * massvec.unsqueeze(-1))
 
 
-def unproject_from_basis(coeffs, evecs):
+def from_basis(values, basis):
     """
-    Transform input coefficients in basis into a signal on the complete shape.
-
-    Parameters
-    -------------------
-    coeffs : (B, K, p) Tensor of coefficients in the spectral basis
-    evecs : (B, n, K) Tensor of eigenvectors
-
-    Output
-    -------------------
-    decoded_values : (B, n, p) values on each vertex
+    Transform data out of an orthonormal basis
+    Inputs:
+      - values: (K,D)
+      - basis: (V,K)
+    Outputs:
+      - (V,D) reconstructed values
     """
-    return evecs @ coeffs
+    if values.is_complex() or basis.is_complex():
+        return torch.cmatmul(torch.ensure_complex(basis), torch.ensure_complex(values))
+    else:
+        return torch.matmul(basis, values)
+    
 
+class LearnedTimeDiffusion(nn.Module):
+    """
+    Applies diffusion with learned per-channel t.
 
-class SpectralDiffusion(nn.Module):
+    In the spectral domain this becomes 
+        f_out = e ^ (lambda_i t) f_in
 
-    def __init__(self, n_channels):
-        """
-        Initializes the module with time parameters to 0.
+    Inputs:
+      - values: (V,C) in the spectral domain
+      - L: (V,V) sparse laplacian
+      - evals: (K) eigenvalues
+      - mass: (V) mass matrix diagonal
 
-        Parameters
-        ------------------
-        n_channels : int - number of input feature functions
-        """
-        # This runs the __init__ function of nn.Module
-        super().__init__()
+      (note: L/evals may be omitted as None depending on method)
+    Outputs:
+      - (V,C) diffused values 
+    """
 
-        self.n_channels = n_channels
+    def __init__(self, C_inout, method='spectral'):
+        super(LearnedTimeDiffusion, self).__init__()
+        self.C_inout = C_inout
+        self.diffusion_time = nn.Parameter(torch.Tensor(C_inout))  # (C)
+        self.method = method # one of ['spectral', 'implicit_dense']
 
-        ## TODO DEFINE AND INITIALIZE THE Diffusion times as learnable parameters.
-        self.diffusion_times = nn.Parameter(torch.Tensor(n_channels))
-        nn.init.constant_(self.diffusion_times, .0)
+        nn.init.constant_(self.diffusion_time, 0.0)
+        
 
+    def forward(self, x, L, mass, evals, evecs):
 
-    def forward(self, x, evals, evecs, vertex_areas):
-        """
-        Given input features x and information on the current meshes
-        return diffused versions of the features.
-
-        Parameters
-        ------------------------
-        x     : (B, n, p) batch of input features. p = self.n_channels
-        evals : (B, K,) batch of eigenvalues
-        evecs : (B, n, K) batch of eigenvectors
-        vertex_areas : (B, n,) batch of vertex areax
-
-
-        Output
-        ------------------------
-        x_diffuse : diffused version of each input feature
-        """
-        # Remove negative diffusion times
+        # project times to the positive halfspace
+        # (and away from 0 in the incredibly rare chance that they get stuck)
         with torch.no_grad():
-            self.diffusion_times.data = torch.clamp(self.diffusion_times, min=1e-8)
+            self.diffusion_time.data = torch.clamp(self.diffusion_time, min=1e-8)
 
-        ## TODO DIFFUSE x
-        times = self.diffusion_times
-        x_spec = project_to_basis(x, evecs, vertex_areas)
-        x_diffuse_spec = torch.exp(-evals.unsqueeze(-1) * times.unsqueeze(0)) * x_spec 
-        x_diffused = unproject_from_basis(x_diffuse_spec, evecs)
-        
-        return x_diffused
+        if x.shape[-1] != self.C_inout:
+            raise ValueError(
+                "Tensor has wrong shape = {}. Last dim shape should have number of channels = {}".format(
+                    x.shape, self.C_inout))
 
-class SpatialGradient(nn.Module):
+        if self.method == 'spectral':
+
+            # Transform to spectral
+            x_spec = to_basis(x, evecs, mass)
+
+            # Diffuse
+            time = self.diffusion_time
+            diffusion_coefs = torch.exp(-evals.unsqueeze(-1) * time.unsqueeze(0))
+            x_diffuse_spec = diffusion_coefs * x_spec
+
+            # Transform back to per-vertex 
+            x_diffuse = from_basis(x_diffuse_spec, evecs)
+            
+        elif self.method == 'implicit_dense':
+            V = x.shape[-2]
+
+            # Form the dense matrices (M + tL) with dims (B,C,V,V)
+            mat_dense = L.to_dense().unsqueeze(1).expand(-1, self.C_inout, V, V).clone()
+            mat_dense *= self.diffusion_time.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            mat_dense += torch.diag_embed(mass).unsqueeze(1)
+
+            # Factor the system
+            cholesky_factors = torch.linalg.cholesky(mat_dense)
+            
+            # Solve the system
+            rhs = x * mass.unsqueeze(-1)
+            rhsT = torch.transpose(rhs, 1, 2).unsqueeze(-1)
+            sols = torch.cholesky_solve(rhsT, cholesky_factors)
+            x_diffuse = torch.transpose(sols.squeeze(-1), 1, 2)
+
+        else:
+            raise ValueError("unrecognized method")
+
+
+        return x_diffuse
+
+
+class SpatialGradientFeatures(nn.Module):
     """
-    Module which computes g_v from vertex embeddings.
+    Compute dot-products between input vectors. Uses a learned complex-linear layer to keep dimension down.
+    
+    Input:
+        - vectors: (V,C,2)
+    Output:
+        - dots: (V,C) dots 
     """
-    def __init__(self, n_channels):
-        """
-        Initializes the module.
 
-        Parameters
-        ------------------
-        n_channels : int - number of input feature functions
-        """
+    def __init__(self, C_inout, with_gradient_rotations=True):
+        super(SpatialGradientFeatures, self).__init__()
 
-        super().__init__()
+        self.C_inout = C_inout
+        self.with_gradient_rotations = with_gradient_rotations
 
-        self.n_channels = n_channels
+        if(self.with_gradient_rotations):
+            self.A_re = nn.Linear(self.C_inout, self.C_inout, bias=False)
+            self.A_im = nn.Linear(self.C_inout, self.C_inout, bias=False)
+        else:
+            self.A = nn.Linear(self.C_inout, self.C_inout, bias=False)
 
-        # Real and Imaginary part of B
-        self.B_re = nn.Linear(self.n_channels, self.n_channels, bias=False)
-        self.B_im = nn.Linear(self.n_channels, self.n_channels, bias=False)
+        # self.norm = nn.InstanceNorm1d(C_inout)
 
-    def forward(self, vects):
-        """
-        Parameters
-        ----------------------
-        Vects : (N, P, 2) per-vertex vector field (w_v)
+    def forward(self, vectors):
 
-        Output
-        ---------------------
-        features : (N, P) per-vertex scalar field
-        """
-        vects_re = vects[...,0]  # (N,P) real part of w_v
-        vects_im = vects[...,1]  # (N,P) imaginary part of w_v
+        vectorsA = vectors # (V,C)
 
-        ## TODO Perform forward pass
-        vectsB_re = self.B_re(vects_re)
-        vectsB_im = self.B_im(vects_im)
-        
-        return torch.tanh(vects_re * vectsB_re + vects_im * vectsB_im)
+        if self.with_gradient_rotations:
+            vectorsBreal = self.A_re(vectors[...,0]) - self.A_im(vectors[...,1])
+            vectorsBimag = self.A_re(vectors[...,1]) + self.A_im(vectors[...,0])
+        else:
+            vectorsBreal = self.A(vectors[...,0])
+            vectorsBimag = self.A(vectors[...,1])
+
+        dots = vectorsA[...,0] * vectorsBreal + vectorsA[...,1] * vectorsBimag
+
+        return torch.tanh(dots)
 
 
 class MiniMLP(nn.Sequential):
     '''
-    A simple MLP with activation and potential dropout
+    A simple MLP with configurable hidden layer sizes.
     '''
-    def __init__(self, layer_sizes, dropout=False, activation=nn.ReLU):
-        """
-        Activation and dropout is applied after all layer BUT the last one
+    def __init__(self, layer_sizes, dropout=False, activation=nn.ReLU, name="miniMLP"):
+        super(MiniMLP, self).__init__()
 
-        Parameters
-        ---------------------------
-        layer_size : list of ints - list of sizes of the MLP
-        dropout    : book - whether to add droupout or not
-        activation : nn.module : activation function
-        """
-        super().__init__()
+        for i in range(len(layer_sizes) - 1):
+            is_last = (i + 2 == len(layer_sizes))
 
-        layer_list = []
-        for i in range(1, len(layer_sizes)):
-          if dropout:
-            layer_list.append(nn.Dropout())
-          layer_list.append(nn.Linear(layer_sizes[i-1], layer_sizes[i]))
+            if dropout and i > 0:
+                self.add_module(
+                    name + "_mlp_layer_dropout_{:03d}".format(i),
+                    nn.Dropout(p=.5)
+                )
 
-          if i<len(layer_sizes)-1:
-            layer_list.append(activation())
+            # Affine map
+            self.add_module(
+                name + "_mlp_layer_{:03d}".format(i),
+                nn.Linear(
+                    layer_sizes[i],
+                    layer_sizes[i + 1],
+                ),
+            )
 
-        ## TODO FILL THE LAYER LIST
-        self.layer = nn.Sequential(*layer_list)
+            # Nonlinearity
+            # (but not on the last layer)
+            if not is_last:
+                self.add_module(
+                    name + "_mlp_act_{:03d}".format(i),
+                    activation()
+                )
 
-    def forward(self, x):
-        """
-        Parameters
-        --------------------
-        x : (n, p) - input features, batch size is the number of vertices !
 
-        Output
-        -------------------
-        y : (n,p') - output features
-        """
-        # NOTHING TO DO HERE
-        return self.layer(x)
-    
 class DiffusionNetBlock(nn.Module):
     """
-    Complete Diffusion block
+    Inputs and outputs are defined at vertices
     """
 
-    def __init__(self, n_channels, mlp_hidden_dims, dropout=True):
-        """
-        Initializes the module.
-
-        Parameters
-        ------------------
-        n_channels      : int - number of feature functions (serves as both input and output)
-        mlp_hidden_dims : list of int - sizes of HIDDEN layers of the miniMLP.
-                          You should add the input and output dimension to it.
-        """
+    def __init__(self, C_width, mlp_hidden_dims,
+                 dropout=True, 
+                 diffusion_method='spectral',
+                 with_gradient_features=True, 
+                 with_gradient_rotations=True):
         super(DiffusionNetBlock, self).__init__()
 
         # Specified dimensions
-        self.n_channels = n_channels
+        self.C_width = C_width
+        self.mlp_hidden_dims = mlp_hidden_dims
 
         self.dropout = dropout
+        self.with_gradient_features = with_gradient_features
+        self.with_gradient_rotations = with_gradient_rotations
 
         # Diffusion block
-        self.diff = SpectralDiffusion(n_channels)
-        self.gradient_features = SpatialGradient(n_channels)
-        mlp_hidden_dims = [3*n_channels, n_channels, n_channels, n_channels]
-        self.mlp = MiniMLP(mlp_hidden_dims, dropout=dropout)
+        self.diffusion = LearnedTimeDiffusion(self.C_width, method=diffusion_method)
+        
+        self.MLP_C = 2*self.C_width
+      
+        if self.with_gradient_features:
+            self.gradient_features = SpatialGradientFeatures(self.C_width, with_gradient_rotations=self.with_gradient_rotations)
+            self.MLP_C += self.C_width
+        
+        # MLPs
+        self.mlp = MiniMLP([self.MLP_C] + self.mlp_hidden_dims + [self.C_width], dropout=self.dropout)
 
 
-    def forward(self, x_in, vertex_areas, evals, evecs, gradX, gradY):
-        """
-        Parameters
-        -------------------
-        x_in         : (B,n,p) - Tensor of input signal.
-        vertex_areas : (B,n) - Tensor of vertex areas
-        evals        : (B, K,) batch of eigenvalues
-        evecs        : (B, n, K) batch of eigenvectors
-        gradX        : Half of gradient matrix, sparse real tensor with dimension [B,N,N]
-        gradY        : Half of gradient matrix, sparse real tensor with dimension [B,N,N]
-
-        Output
-        -------------------
-        x_out : (B,n,p) - Tensor of output signal.
-        """
+    def forward(self, x_in, mass, L, evals, evecs, gradX, gradY):
 
         # Manage dimensions
         B = x_in.shape[0] # batch dimension
+        if x_in.shape[-1] != self.C_width:
+            raise ValueError(
+                "Tensor has wrong shape = {}. Last dim shape should have number of channels = {}".format(
+                    x_in.shape, self.C_width))
+        
+        # Diffusion block 
+        x_diffuse = self.diffusion(x_in, L, mass, evals, evecs)
 
-        # Diffusion block
-        x_diffuse = self.diff(x_in, evals, evecs, vertex_areas) # DIFFUSED X_in  # (B, N, p)
+        # Compute gradient features, if using
+        if self.with_gradient_features:
 
+            # Compute gradients
+            x_grads = [] # Manually loop over the batch (if there is a batch dimension) since torch.mm() doesn't support batching
+            for b in range(B):
+                # gradient after diffusion
+                x_gradX = torch.mm(gradX[b,...], x_diffuse[b,...])
+                x_gradY = torch.mm(gradY[b,...], x_diffuse[b,...])
 
-        # Compute the batch of gradients
-        x_grads = [] # Manually loop over the batch
-        for b in range(B):
-            # gradient after diffusion
-            x_gradX = torch.mm(gradX[b,...], x_diffuse[b,...])
-            x_gradY = torch.mm(gradY[b,...], x_diffuse[b,...])
+                x_grads.append(torch.stack((x_gradX, x_gradY), dim=-1))
+            x_grad = torch.stack(x_grads, dim=0)
 
-            x_grads.append(torch.stack((x_gradX, x_gradY), dim=-1))
+            # Evaluate gradient features
+            x_grad_features = self.gradient_features(x_grad) 
 
-        x_grad = torch.stack(x_grads, dim=0)  # (B, N, P, 2)
+            # Stack inputs to mlp
+            feature_combined = torch.cat((x_in, x_diffuse, x_grad_features), dim=-1)
+        else:
+            # Stack inputs to mlp
+            feature_combined = torch.cat((x_in, x_diffuse), dim=-1)
 
-        # TODO EVALUATE GRADIENT FEATURES
-        x_grad_features = self.gradient_features(x_grad) 
-
-        # TODO APPLY THE MLP TO THE CONCATENATED FEATURES
-        feature_combined = torch.cat((x_in, x_diffuse, x_grad_features), dim=-1)
+        
+        # Apply the mlp
         x0_out = self.mlp(feature_combined)
 
-        # TODO APPLY THE RESIDUAL CONNECTION
+        # Skip connection
         x0_out = x0_out + x_in
 
         return x0_out
 
+
 class DiffusionNet(nn.Module):
 
-    def __init__(self, p_in, p_out, n_channels=128, N_block=4, last_activation=None, mlp_hidden_dims=None, dropout=True):
+    def __init__(self, C_in, C_out, C_width=128, N_block=4, last_activation=None, outputs_at='vertices', mlp_hidden_dims=None, dropout=True, 
+                       with_gradient_features=True, with_gradient_rotations=True, diffusion_method='spectral'):   
         """
         Construct a DiffusionNet.
-        Parameters
-        --------------------
-        p_in            : int - input dimension of the network
-        p_out           : int - output dimension  of the network
-        n_channels      : int - dimension of internal DiffusionNet blocks (default: 128)
-        N_block         : int - number of DiffusionNet blocks (default: 4)
-        last_activation : int - a function to apply to the final outputs of the network, such as torch.nn.functional.log_softmax
-        mlp_hidden_dims : list of int - a list of hidden layer sizes for MLPs (default: [C_width, C_width])
-        dropout         : bool - if True, internal MLPs use dropout (default: True)
+
+        Parameters:
+            C_in (int):                     input dimension 
+            C_out (int):                    output dimension 
+            last_activation (func)          a function to apply to the final outputs of the network, such as torch.nn.functional.log_softmax (default: None)
+            outputs_at (string)             produce outputs at various mesh elements by averaging from vertices. One of ['vertices', 'edges', 'faces', 'global_mean']. (default 'vertices', aka points for a point cloud)
+            C_width (int):                  dimension of internal DiffusionNet blocks (default: 128)
+            N_block (int):                  number of DiffusionNet blocks (default: 4)
+            mlp_hidden_dims (list of int):  a list of hidden layer sizes for MLPs (default: [C_width, C_width])
+            dropout (bool):                 if True, internal MLPs use dropout (default: True)
+            diffusion_method (string):      how to evaluate diffusion, one of ['spectral', 'implicit_dense']. If implicit_dense is used, can set k_eig=0, saving precompute.
+            with_gradient_features (bool):  if True, use gradient features (default: True)
+            with_gradient_rotations (bool): if True, use gradient also learn a rotation of each gradient. Set to True if your surface has consistently oriented normals, and False otherwise (default: True)
         """
 
         super(DiffusionNet, self).__init__()
@@ -264,81 +293,141 @@ class DiffusionNet(nn.Module):
         ## Store parameters
 
         # Basic parameters
-        self.p_in = p_in
-        self.p_out = p_out
-        self.n_channels = n_channels
+        self.C_in = C_in
+        self.C_out = C_out
+        self.C_width = C_width
         self.N_block = N_block
 
         # Outputs
         self.last_activation = last_activation
+        self.outputs_at = outputs_at
+        if outputs_at not in ['vertices', 'edges', 'faces', 'global_mean']: raise ValueError("invalid setting for outputs_at")
 
         # MLP options
         if mlp_hidden_dims == None:
-            mlp_hidden_dims = [n_channels, n_channels]
+            mlp_hidden_dims = [C_width, C_width]
         self.mlp_hidden_dims = mlp_hidden_dims
         self.dropout = dropout
+        
+        # Diffusion
+        self.diffusion_method = diffusion_method
+        if diffusion_method not in ['spectral', 'implicit_dense']: raise ValueError("invalid setting for diffusion_method")
 
+        # Gradient features
+        self.with_gradient_features = with_gradient_features
+        self.with_gradient_rotations = with_gradient_rotations
+        
+        ## Set up the network
 
-        ## TODO SETUP THE NETWORK (LINEAR LAYERS + BLOCKS)
+        # First and last affine layers
+        self.first_lin = nn.Linear(C_in, C_width)
+        self.last_lin = nn.Linear(C_width, C_out)
+       
+        # DiffusionNet blocks
+        self.blocks = []
+        for i_block in range(self.N_block):
+            block = DiffusionNetBlock(C_width = C_width,
+                                      mlp_hidden_dims = mlp_hidden_dims,
+                                      dropout = dropout,
+                                      diffusion_method = diffusion_method,
+                                      with_gradient_features = with_gradient_features, 
+                                      with_gradient_rotations = with_gradient_rotations)
 
-        self.blocks = [] # TOFILL
-        self.blocks.append(nn.Linear(self.p_in, self.n_channels))
-        for i in range(N_block):
-          self.blocks.append(DiffusionNetBlock(n_channels, mlp_hidden_dims, dropout))
-        self.blocks.append(nn.Linear(self.n_channels, self.p_out))
+            self.blocks.append(block)
+            self.add_module("block_"+str(i_block), self.blocks[-1])
 
-        self.net = nn.ModuleList(self.blocks)
-
-    def forward(self, x_in, vertex_areas, evals=None, evecs=None, gradX=None, gradY=None):
+    
+    def forward(self, x_in, mass, L=None, evals=None, evecs=None, gradX=None, gradY=None, edges=None, faces=None):
         """
-        Progapate a signal through the network.
-        Can handle input without batch dimension (will add a dummy dimension to set batch size to 1)
+        A forward pass on the DiffusionNet.
 
-        Parameters
-        --------------------
-        x_in         : (n,p) or (B,n,p) - Tensor of input signal.
-        vertex_areas : (n,) or (B,n) - Tensor of vertex areas
-        evals        : (B, K,) or (K,) batch of eigenvalues
-        evecs        : (B, n, K) or (n, K) batch of eigenvectors
-        gradX        : Half of gradient matrix, sparse real tensor with dimension [N,N] or [B,N,N]
-        gradY        : Half of gradient matrix, sparse real tensor with dimension [N,N] or [B,N,N]
+        In the notation below, dimension are:
+            - C is the input channel dimension (C_in on construction)
+            - C_OUT is the output channel dimension (C_out on construction)
+            - N is the number of vertices/points, which CAN be different for each forward pass
+            - B is an OPTIONAL batch dimension
+            - K_EIG is the number of eigenvalues used for spectral acceleration
+        Generally, our data layout it is [N,C] or [B,N,C].
 
-        Output
-        -----------------------
-        x_out (tensor):    Output with dimension [N,C_out] or [B,N,C_out]
+        Call get_operators() to generate geometric quantities mass/L/evals/evecs/gradX/gradY. Note that depending on the options for the DiffusionNet, not all are strictly necessary.
+
+        Parameters:
+            x_in (tensor):      Input features, dimension [N,C] or [B,N,C]
+            mass (tensor):      Mass vector, dimension [N] or [B,N]
+            L (tensor):         Laplace matrix, sparse tensor with dimension [N,N] or [B,N,N]
+            evals (tensor):     Eigenvalues of Laplace matrix, dimension [K_EIG] or [B,K_EIG]
+            evecs (tensor):     Eigenvectors of Laplace matrix, dimension [N,K_EIG] or [B,N,K_EIG]
+            gradX (tensor):     Half of gradient matrix, sparse real tensor with dimension [N,N] or [B,N,N]
+            gradY (tensor):     Half of gradient matrix, sparse real tensor with dimension [N,N] or [B,N,N]
+
+        Returns:
+            x_out (tensor):    Output with dimension [N,C_out] or [B,N,C_out]
         """
 
 
         ## Check dimensions, and append batch dimension if not given
-        if x_in.shape[-1] != self.p_in:
-            raise ValueError(f"DiffusionNet was constructed with p_in={self.p_in}, "
-                             f"but x_in has last dim={x_in.shape[-1]}")
+        if x_in.shape[-1] != self.C_in: 
+            raise ValueError("DiffusionNet was constructed with C_in={}, but x_in has last dim={}".format(self.C_in,x_in.shape[-1]))
         N = x_in.shape[-2]
-
         if len(x_in.shape) == 2:
             appended_batch_dim = True
 
             # add a batch dim to all inputs
-            x_in = x_in.unsqueeze(0) # (B, N, P)
-            vertex_areas = vertex_areas.unsqueeze(0) # (B, N)
-            if evals != None: evals = evals.unsqueeze(0) # (B,K)
-            if evecs != None: evecs = evecs.unsqueeze(0) # (B,N,K)
-            if gradX != None: gradX = gradX.unsqueeze(0) # (B,N,N)
-            if gradY != None: gradY = gradY.unsqueeze(0) # (B,N,N)
+            x_in = x_in.unsqueeze(0)
+            mass = mass.unsqueeze(0)
+            if L != None: L = L.unsqueeze(0)
+            if evals != None: evals = evals.unsqueeze(0)
+            if evecs != None: evecs = evecs.unsqueeze(0)
+            if gradX != None: gradX = gradX.unsqueeze(0)
+            if gradY != None: gradY = gradY.unsqueeze(0)
+            if edges != None: edges = edges.unsqueeze(0)
+            if faces != None: faces = faces.unsqueeze(0)
 
         elif len(x_in.shape) == 3:
             appended_batch_dim = False
-
-        else: raise ValueError("x_in should be tensor with shape (n,p) or (B,n,p)")
-
-        ##  TODO PROCESS THE INPUTS
-        x_p = self.blocks[0](x_in)
-        for i in range(self.N_block):
-          x_p = self.blocks[i+1](x_p, vertex_areas, evals, evecs, gradX, gradY)
-        x_out = self.blocks[-1](x_p)
         
+        else: raise ValueError("x_in should be tensor with shape [N,C] or [B,N,C]")
+        
+        # Apply the first linear layer
+        x = self.first_lin(x_in)
+      
+        # Apply each of the blocks
+        for b in self.blocks:
+            x = b(x, mass, L, evals, evecs, gradX, gradY)
+        
+        # Apply the last linear layer
+        x = self.last_lin(x)
+
+        # Remap output to faces/edges if requested
+        if self.outputs_at == 'vertices': 
+            x_out = x
+        
+        elif self.outputs_at == 'edges': 
+            # Remap to edges
+            x_gather = x.unsqueeze(-1).expand(-1, -1, -1, 2)
+            edges_gather = edges.unsqueeze(2).expand(-1, -1, x.shape[-1], -1)
+            xe = torch.gather(x_gather, 1, edges_gather)
+            x_out = torch.mean(xe, dim=-1)
+        
+        elif self.outputs_at == 'faces': 
+            # Remap to faces
+            x_gather = x.unsqueeze(-1).expand(-1, -1, -1, 3)
+            faces_gather = faces.unsqueeze(2).expand(-1, -1, x.shape[-1], -1)
+            xf = torch.gather(x_gather, 1, faces_gather)
+            x_out = torch.mean(xf, dim=-1)
+        
+        elif self.outputs_at == 'global_mean': 
+            # Produce a single global mean ouput.
+            # Using a weighted mean according to the point mass/area is discretization-invariant. 
+            # (A naive mean is not discretization-invariant; it could be affected by sampling a region more densely)
+            x_out = torch.sum(x * mass.unsqueeze(-1), dim=-2) / torch.sum(mass, dim=-1, keepdim=True)
+        
+        # Apply last nonlinearity if specified
+        if self.last_activation != None:
+            x_out = self.last_activation(x_out)
+
         # Remove batch dim if we added it
         if appended_batch_dim:
-            x_out = x_out.squeeze(0) # (N, p_out)
+            x_out = x_out.squeeze(0)
 
         return x_out
