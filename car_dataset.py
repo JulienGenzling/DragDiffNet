@@ -8,7 +8,7 @@ from utils import get_geometry
 
 
 class CarMeshDataset(Dataset):
-    """RNA Mesh Dataset"""
+    """Car Mesh Dataset"""
 
     def __init__(self, data_dir, fold, train, n_eig, device):
         """

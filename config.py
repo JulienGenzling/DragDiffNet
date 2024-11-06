@@ -9,7 +9,7 @@ class Config:
     seed = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_folds = 1
-    n_workers = 10
+    n_workers = 16
     
     # Data
     data_basepath = "/Data/tested"

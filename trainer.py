@@ -130,14 +130,21 @@ class Trainer(object):
             # MAYBE DO SOMETHING TO THE PREDS
 
             # COMPUTE THE LOSS
-            loss = self.loss(preds, label).float()##
+            # print(preds, label)
+            loss = self.loss(preds, label)##
 
             loss.backward()
             self.optimizer.step()
 
             train_loss += loss.item()
 
-        return train_loss/len(self.train_loader)
+            # COMPUTE TRAINING ACCURACY
+            pred_labels = torch.argmax(preds, dim=-1)
+
+            n_correct = pred_labels.eq(label).sum().item() # number of correct predictions
+            train_acc += n_correct/label.shape[0]
+
+        return train_loss/len(self.train_loader), train_acc/len(self.train_loader)
 
     def valid_epoch(self):
         """
@@ -160,7 +167,6 @@ class Trainer(object):
             gradY = batch["gradY"].to(self.device)
             labels = batch["label"].to(self.device)
 
-            # TODO PERFORM FORWARD STEP
             preds = self.forward_step(verts, faces, frames, vertex_area, L, evals, evecs, gradX, gradY)
             # MAYBE DO SOMETHING TO THE PREDS
 
@@ -169,6 +175,11 @@ class Trainer(object):
 
             val_loss += loss.item()
 
+            # Compute ACCURACCY
+            pred_labels = torch.argmax(preds, dim=-1)
+
+            n_correct = pred_labels.eq(labels).sum().item() # number of correct predictions
+            val_acc += n_correct/labels.shape[0]
         print("End val epoch")
         return val_loss/len(self.valid_loader)
 
