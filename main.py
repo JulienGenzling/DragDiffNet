@@ -4,21 +4,11 @@ from car_dataset import CarMeshDataset
 from torch.utils.data import DataLoader
 from trainer import Trainer
 from model import DiffusionNet
-from cache import prepopulate_cache
 from utils import create_fold_splits
 
 from config import Config
 
 torch.manual_seed(Config.seed)
-
-# Cache data
-print("Caching data (might take a while)...")
-# prepopulate_cache(
-#     Config.data_basepath,
-#     cache_dir=Config.cache_dir,
-#     n_eig=Config.num_eig,
-#     n_workers=Config.n_workers,
-# )
 
 
 for fold in range(Config.n_folds):

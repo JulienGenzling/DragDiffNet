@@ -7,6 +7,7 @@ from tqdm import tqdm
 import torch
 from config import Config
 
+
 def prepopulate_cache_file(obj_file_path: str, cache_dir: str, n_eig: int) -> None:
     """
     Pre-populates the cache 1 mesh.
@@ -28,7 +29,11 @@ def prepopulate_cache_file(obj_file_path: str, cache_dir: str, n_eig: int) -> No
 
 
 def prepopulate_cache(
-    data_basepath: str, cache_dir: str, n_eig: int, n_workers: int
+    data_basepath: str,
+    cache_dir: str,
+    n_eig: int,
+    n_workers: int,
+    use_augmentation: bool,
 ) -> None:
     """
     Pre-populates the cache directory with all available meshes.
@@ -42,28 +47,36 @@ def prepopulate_cache(
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Gather all .obj files, excluding certain suffixes
-    all_obj_files = [
-        os.path.join(data_basepath, "meshes", f)
-        for f in os.listdir(os.path.join(data_basepath, "meshes"))
-        # if not (f.endswith("_flip.obj") or f.endswith("_aug.obj"))
-    ]
+    if use_augmentation:
+        all_obj_files = [
+            os.path.join(data_basepath, "meshes_aug", f)
+            for f in os.listdir(os.path.join(data_basepath, "meshes_aug"))
+            if not f.endswith("_aug.obj")
+        ]
+    else:
+        all_obj_files = [
+            os.path.join(data_basepath, "meshes", f)
+            for f in os.listdir(os.path.join(data_basepath, "meshes"))
+            if not f.endswith("_flip.obj")
+        ]
 
-    # Set up the worker function with partial to include constant arguments
     worker = partial(prepopulate_cache_file, cache_dir=cache_dir, n_eig=n_eig)
 
-    # Use Pool with tqdm for a progress bar
     with Pool(processes=n_workers) as pool:
-        # Wrap the pool.imap with tqdm for progress tracking
-        for _ in tqdm(pool.imap(worker, all_obj_files), total=len(all_obj_files), desc="Caching files"):
+        for _ in tqdm(
+            pool.imap(worker, all_obj_files),
+            total=len(all_obj_files),
+            desc="Caching files",
+        ):
             pass
 
-if __name__ == '__main__':
-# Cache data
+
+if __name__ == "__main__":
     print("Caching data (might take a while)...")
     prepopulate_cache(
         Config.data_basepath,
         cache_dir=Config.cache_dir,
         n_eig=Config.num_eig,
         n_workers=Config.n_workers,
+        use_augmentation=Config.augment,
     )
