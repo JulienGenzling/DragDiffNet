@@ -13,6 +13,7 @@ import scipy.sparse.linalg as sla
 import torch
 import potpourri3d as pp3d
 from sklearn.model_selection import KFold, train_test_split
+from config import Config
 
 def create_fold_splits(
     path: str,
@@ -20,21 +21,25 @@ def create_fold_splits(
     n_folds: int = 1,
     ratio: float = 0.8,
     seed: int = 42,
+    n_eig: int = 32,
 ) -> None:
     """
     Splits data into train and test sets for n-fold cross-validation.
 
     Parameters:
-    - csv_path (str): Path to the CSV file containing filenames.
+    - path (str): Path to the .npz cached files.
     - output_file (str): Path to save the JSON output with the train/test split information.
     - train_ratio (float): Ratio of files to include in the train set if n=1.
     - n (int): Number of folds for cross-validation. If n=1, perform a single 80/20 split.
+    - n_eig (int): Number of eigenvalues to use.
     """
+    label_map = pd.read_csv(os.path.join(Config.data_basepath, "drag_coeffs.csv"))
 
     all_files = os.listdir(path)
-    files = [
-        f.split("_")[0] for f in all_files if not (f.endswith("_flip") or f.endswith("_aug"))
-    ]
+    files = [f for f in all_files if '_'.join(f.split("_")[:-1]) in label_map.file.values and (int(f.split(".")[0].split("_")[-1]) == n_eig)]
+    # files = [
+    #     f.split("_")[0] for f in all_files if f.split("_")[0] in label_map.file.values
+    # ]
 
     random.seed(seed)
     random.shuffle(files)

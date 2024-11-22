@@ -11,27 +11,16 @@ from config import Config
 
 torch.manual_seed(Config.seed)
 
-# Cache data
-print("Caching data (might take a while)...")
-# prepopulate_cache(
-#     Config.data_basepath,
-#     cache_dir=Config.cache_dir,
-#     n_eig=Config.num_eig,
-#     n_workers=Config.n_workers,
-# )
-
-
 for fold in range(Config.n_folds):
     # Create fold splits
-    print("Creating splits...")
-    create_fold_splits(
-        os.path.join(Config.data_basepath, "cache"),
-        os.path.join(Config.data_basepath, "splits.json"),
-        n_folds=Config.n_folds,
-        ratio=Config.train_ratio,
-        seed=Config.seed,
-        n_eig=Config.num_eig,
-    )  # Will save a splits.json file in data_basepath
+    # print("Creating splits...")
+    # create_fold_splits(
+    #     os.path.join(Config.data_basepath, "cache"),
+    #     os.path.join(Config.data_basepath, "splits.json"),
+    #     n_folds=Config.n_folds,
+    #     ratio=Config.train_ratio,
+    #     seed=Config.seed,
+    # )  # Will save a splits.json file in data_basepath
 
     # Create dataloaders
     print("Creating dataloaders...")
@@ -64,6 +53,7 @@ for fold in range(Config.n_folds):
         persistent_workers=False,
     )
 
+
     # Create trainer
     model_cfg = {
         "inp_feat": Config.inp_feat,
@@ -83,9 +73,22 @@ for fold in range(Config.n_folds):
         device=Config.device,
         save_dir=Config.save_dir,
         figures_dir=Config.figures_dir,
-        log_wandb=Config.log_wandb,
-        num_epochs=Config.num_epochs,
+        log_wandb=False,
     )
 
-    # Run train
-    my_trainer.run()
+    print('--')
+
+    model = DiffusionNet(
+        C_in=model_cfg['p_in'],
+        C_out=model_cfg['p_out'],
+        N_block=model_cfg['N_block'],
+        outputs_at=model_cfg['outputs_at'],
+        )
+    print("Loading model")
+    model.load_state_dict(torch.load(os.path.join(Config.save_dir, "model_final.pth"), weights_only=True))
+    my_trainer.model = model.to(Config.device)
+    val_loss, val_r2, all_labels, all_preds = my_trainer.valid_epoch()
+    print(val_loss, val_r2)
+    my_trainer.plot_pred_vs_sim(all_labels, all_preds)
+
+    print("Done")

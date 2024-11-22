@@ -12,10 +12,10 @@ class CarMeshDataset(Dataset):
 
     def __init__(self, data_dir, fold, train, n_eig, device):
         """
-        root_dir (string): Directory with all the meshes.
+        data_dir (string): Directory with the csv label map.
+        fold (int): fold number.
         train (bool): If True, use the training set, else use the test set.
-        op_cache_dir (string): Directory to cache the operators.
-        n_classes (int): Number of classes.
+        n_eig (int): Number of eigenvectors to use for processing.
         device (str): device (:D)
         """
 
@@ -36,25 +36,29 @@ class CarMeshDataset(Dataset):
             split[f"fold_{fold}"]["train"] if train else split[f"fold_{fold}"]["test"]
         )
 
-        self.all_items = [item.split("_")[0] for item in self.all_items if item.split("_")[0] in this_fold_files]
+        # self.all_items = [item.split("_")[0] for item in self.all_items if item.split("_")[0] in this_fold_files]
+        self.all_items = [item for item in self.all_items if item in this_fold_files]
 
     def __len__(self):
         return len(self.all_items)
 
     def __getitem__(self, idx):
-        cached_filepath = os.path.join(self.cache_dir, f"{self.all_items[idx]}_{self.n_eig}.npz")
+        cached_filepath = os.path.join(self.cache_dir, self.all_items[idx])
+        # cached_filepath = os.path.join(self.cache_dir, f"{self.all_items[idx]}_{self.n_eig}.npz")
         verts, faces, frames, mass, L, evals, evecs, gradX, gradY = get_geometry(
             cached_filepath, self.device
         )
-        possible_labels = [
-            self.all_items[idx], 
-            self.all_items[idx] + "_flip",
-            self.all_items[idx] + "_aug",
-            self.all_items[idx] + "_flip_aug"
-        ]
-        label = self.label_map[
-            self.label_map["file"].isin(possible_labels)
-        ]["Cd"].values[0]
+        # possible_labels = [
+        #     self.all_items[idx], 
+        #     self.all_items[idx] + "_flip",
+        #     self.all_items[idx] + "_aug",
+        #     self.all_items[idx] + "_flip_aug"
+        # ]
+        # label = self.label_map[
+        #     self.label_map["file"].isin(possible_labels)
+        # ]["Cd"].values[0]
+        label = self.label_map[self.label_map["file"] == '_'.join(self.all_items[idx].split("_")[:-1])]["Cd"].values[0]
+
         dict = {
             "vertices": verts,
             "faces": faces,

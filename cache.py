@@ -46,7 +46,7 @@ def prepopulate_cache(
     all_obj_files = [
         os.path.join(data_basepath, "meshes", f)
         for f in os.listdir(os.path.join(data_basepath, "meshes"))
-        if not (f.endswith("_flip.obj") or f.endswith("_aug.obj"))
+        # if not (f.endswith("_flip.obj") or f.endswith("_aug.obj"))
     ]
 
     # Set up the worker function with partial to include constant arguments

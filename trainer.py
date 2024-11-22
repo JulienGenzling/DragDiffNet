@@ -5,15 +5,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import plot_utils as plu
 from mesh_utils.mesh import TriMesh
-
 from tqdm import tqdm 
+from sklearn.metrics import r2_score
+import wandb
 
 class Trainer(object):
 
     def __init__(self, diffusionnet_cls, model_cfg, train_loader, valid_loader, device='cuda',
                  lr=1e-3, weight_decay=1e-4, num_epochs=200,
                  lr_decay_every = 50, lr_decay_rate = 0.5,
-                 log_interval=1, save_dir=None):
+                 log_interval=1, save_dir=None, figures_dir=None, log_wandb=False):
 
         """
         diffusionnet_cls: (nn.Module) class of the DiffusionNet model
@@ -28,9 +29,10 @@ class Trainer(object):
         lr_decay_rate: (float) decay learning rate by this factor
         log_interval: (int) print training stats every this many iterations
         save_dir: (str) directory to save model checkpoints
+        figures_dir: (str) directory to save figures
+        log_wandb: (bool) log wandb or not 
         """
 
-        # TOD build the network from the model_cfg
         self.model = diffusionnet_cls(
             C_in=model_cfg['p_in'],
             C_out=model_cfg['p_out'],
@@ -40,10 +42,6 @@ class Trainer(object):
 
 
         self.loss = nn.MSELoss()
-
-
-
-        ## THIS PART JUST STORES SOME OTHER PARAMETERS
         self.train_loader = train_loader
         self.valid_loader = valid_loader
         self.device = device
@@ -53,11 +51,11 @@ class Trainer(object):
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
-
         self.lr_decay_every = lr_decay_every
         self.lr_decay_rate = lr_decay_rate
         self.log_interval = log_interval
         self.save_dir = save_dir
+        self.figures_dir = figures_dir
 
         self.train_losses = []
         self.test_losses = []
@@ -71,6 +69,10 @@ class Trainer(object):
 
         self.model.to(self.device)
 
+        self.log_wandb = log_wandb
+        if self.log_wandb:
+            wandb.init(project='DragDiffNet', config=model_cfg)
+            wandb.watch(self.model)
 
     def forward_step(self, verts, faces, frames, vertex_area, L, evals, evecs, gradX, gradY):
         """
@@ -94,13 +96,12 @@ class Trainer(object):
         if self.inp_feat == 'xyz':
             features = verts
         elif self.inp_feat == 'hks':
-            features = self.compute_HKS(verts, faces, self.num_eig, n_feat=32)
+            features = self.compute_HKS(evecs, evals, self.num_eig, n_feat=32)
         elif self.inp_feat == 'wks':
             features = self.compute_WKS(verts, faces, self.num_eig, num_E=32)
 
         preds = self.model(features, vertex_area, evals=evals, evecs=evecs, gradX=gradX, gradY=gradY)
 
-        # MAYBE ADD ACTIVATION
         return preds
 
 
@@ -110,7 +111,8 @@ class Trainer(object):
         Train the network for one epoch
         """
         train_loss = 0
-        train_acc = 0
+        all_preds = []
+        all_labels = []
         for i, batch in enumerate(tqdm(self.train_loader, "Train epoch")):
 
             verts = batch["vertices"].to(self.device)
@@ -127,31 +129,31 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             preds = self.forward_step(verts, faces, frames, vertex_area, L, evals, evecs, gradX, gradY)
-            # MAYBE DO SOMETHING TO THE PREDS
-
-            # COMPUTE THE LOSS
-            # print(preds, label)
-            loss = self.loss(preds, label)##
+            loss = self.loss(preds, label).float()
 
             loss.backward()
             self.optimizer.step()
 
             train_loss += loss.item()
 
-            # COMPUTE TRAINING ACCURACY
-            pred_labels = torch.argmax(preds, dim=-1)
+            # Collect predictions and labels for R2 score
+            all_preds.append(preds.detach().cpu().numpy())
+            all_labels.append(label.detach().cpu().numpy()[None])
 
-            n_correct = pred_labels.eq(label).sum().item() # number of correct predictions
-            train_acc += n_correct/label.shape[0]
+        # Compute R2 score
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+        train_r2 = r2_score(all_labels, all_preds)
 
-        return train_loss/len(self.train_loader), train_acc/len(self.train_loader)
+        return train_loss/len(self.train_loader), train_r2
 
     def valid_epoch(self):
         """
         Run a validation epoch
         """
         val_loss = 0
-        val_acc = 0
+        all_preds = []
+        all_labels = []
         print("Start val epoch")
         for i, batch in enumerate(self.valid_loader):
 
@@ -168,75 +170,91 @@ class Trainer(object):
             labels = batch["label"].to(self.device)
 
             preds = self.forward_step(verts, faces, frames, vertex_area, L, evals, evecs, gradX, gradY)
-            # MAYBE DO SOMETHING TO THE PREDS
-
-            # Compute Loss - THIS DEPENDS ON YOUR CHOICE OF LOSS
-            loss = self.loss(preds, labels)##
+            loss = self.loss(preds, labels)
 
             val_loss += loss.item()
 
-            # Compute ACCURACCY
-            pred_labels = torch.argmax(preds, dim=-1)
+            # Collect predictions and labels for R2 score
+            all_preds.append(preds.detach().cpu().numpy())
+            all_labels.append(labels.detach().cpu().numpy()[None])
 
-            n_correct = pred_labels.eq(labels).sum().item() # number of correct predictions
-            val_acc += n_correct/labels.shape[0]
+        # Compute R2 score
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+        val_r2 = r2_score(all_labels, all_preds)
+
         print("End val epoch")
-        return val_loss/len(self.valid_loader)
+        return val_loss/len(self.valid_loader), val_r2, all_labels, all_preds
 
     def run(self):
-        os.makedirs('./models', exist_ok=True)
+        os.makedirs(self.save_dir, exist_ok=True)
         for epoch in range(self.num_epochs):
             self.model.train()
 
             if epoch % self.lr_decay_every == 0:
                 self.adjust_lr()
 
-            train_ep_loss = self.train_epoch()
+            train_ep_loss, train_r2 = self.train_epoch()
             self.train_losses.append(train_ep_loss)
 
             if epoch % self.log_interval == 0:
-                val_loss = self.valid_epoch()
+                val_loss, val_r2, all_labels, all_preds = self.valid_epoch()
                 torch.save(self.model.state_dict(), os.path.join(self.save_dir, 'model_latest.pth'))
                 print(f'Epoch: {epoch:03d}/{self.num_epochs}, '
                       f'Train Loss: {train_ep_loss:.4f}, '
-                      f'Val Loss: {val_loss:.4f}, ')
+                      f'Train R2: {train_r2:.4f}, '
+                      f'Val Loss: {val_loss:.4f}, '
+                      f'Val R2: {val_r2:.4f}')
+                # Log metrics to wandb
+                if self.log_wandb:
+                    wandb.log({
+                        'train_loss': train_ep_loss,
+                        'train_r2': train_r2,
+                        'val_loss': val_loss,
+                        'val_r2': val_r2,
+                    })
+
         torch.save(self.model.state_dict(), os.path.join(self.save_dir, 'model_final.pth'))
 
+        self.plot_pred_vs_sim(self, all_labels, all_preds)
 
-    def visualize(self):
+    def plot_pred_vs_sim(self, all_labels, all_preds):
+        os.makedirs(self.figures_dir, exist_ok=True)
+
+        plt.figure(figsize=(8, 8))
+        plt.scatter(all_labels, all_preds, alpha=0.6, color='blue', edgecolor='k', s=10)
+        plt.plot([0, 1], [0, 1], 'k--', linewidth=1)  # Diagonal reference line
+        plt.xlabel('Simulated drag coefficient')
+        plt.ylabel('Predicted drag coefficient')
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        plt.title('Predicted vs Simulated Drag Coefficient')
+
+        # Save plot in figures directory
+        figure_path = os.path.join(self.figures_dir, 'plot_pred_vs_sim.png')
+        plt.savefig(figure_path)
+        plt.close()
+
+
+    def visualize(self, i=0, j=1):
         """
-        We only test the first two shapes of validation set.
+        We only test two shapes of validation set.
         """
         self.model.eval()
         test_seg_meshes = []
-
+        labels = []
+        verts = []
         for i, batch in enumerate(self.valid_loader):
-            verts = batch["vertices"].to(self.device)
-            faces = batch["faces"].to(self.device)
-            frames = batch["frames"].to(self.device)
-            vertex_area = batch["vertex_area"].to(self.device)
-            L = batch["L"].to(self.device)
-            evals = batch["evals"].to(self.device)
-            evecs = batch["evecs"].to(self.device)
-            gradX = batch["gradX"].to(self.device)
-            gradY = batch["gradY"].to(self.device)
-            labels = batch["labels"].to(self.device)
+            verts.append(batch["vertices"])
+            labels.append(batch["label"])
+            test_seg_meshes.append(TriMesh(batch["vertices"], batch["faces"]))
 
-
-            preds = self.forward_step(verts, faces, frames, vertex_area, L, evals, evecs, gradX, gradY)
-            pred_labels = torch.max(preds, dim=1).indices
-
-            test_seg_meshes.append([TriMesh(verts.cpu().numpy(), faces.cpu().numpy()),
-                                  pred_labels.cpu().numpy()])
-            if i==1:
+            if i==10:
                 break
 
-
-        cmap1 = plt.get_cmap("jet")(test_seg_meshes[0][-1] / (146))[:,:3]
-        cmap2 = plt.get_cmap("jet")(test_seg_meshes[1][-1] / (146))[:,:3]
-
-        plu.double_plot(test_seg_meshes[0][0], test_seg_meshes[1][0], cmap1, cmap2)
-        #return plot_multi_meshes(test_seg_meshes, cmap='vert_colors')
+        plu.double_plot(test_seg_meshes[i], test_seg_meshes[j])
+        print(f"Cx value: {labels[i]}, {labels[j]}")
+        print(f"Number of verts: {verts[i].shape[0]}, {verts[j].shape[0]}")
 
     def adjust_lr(self):
         lr = self.lr * self.lr_decay_rate
@@ -255,20 +273,20 @@ class Trainer(object):
         Returns:
             hks (torch.Tensor): (N, n_feat) tensor of HKS features
         """
-        abs_ev = torch.sort(torch.abs(evals)).values[:num_eig]
+        abs_ev = torch.sort(torch.abs(evals)).values[:num_eig].detach().cpu()
 
         t_list = np.geomspace(4*np.log(10)/abs_ev[-1], 4*np.log(10)/abs_ev[1], n_feat)
-        t_list = torch.from_tensor(t_list.astype(np.float32)).to(device=evecs.device)
+        t_list = torch.Tensor(t_list.astype(np.float32))
 
         evals_s = abs_ev
 
         coefs = torch.exp(-t_list[:,None] * evals_s[None,:])  # (num_T,K)
 
-        natural_HKS = np.einsum('tk,nk->nt', coefs, evecs[:,:num_eig].square())
+        natural_HKS = np.einsum('tk,nk->nt', coefs, evecs.detach().cpu()[:,:num_eig].square())
 
         inv_scaling = coefs.sum(1)  # (num_T)
 
-        return (1/inv_scaling)[None,:] * natural_HKS
+        return ((1/inv_scaling)[None,:] * natural_HKS).to(device=evecs.device)
 
     def compute_WKS(self, evecs, evals, num_eig, n_feat):
         """
