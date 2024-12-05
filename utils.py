@@ -33,13 +33,10 @@ def create_fold_splits(
     - n (int): Number of folds for cross-validation. If n=1, perform a single 80/20 split.
     - n_eig (int): Number of eigenvalues to use.
     """
-    label_map = pd.read_csv(os.path.join(Config.data_basepath, "drag_coeffs.csv"))
+    label_map = pd.read_csv(Config.labels_path)
 
     all_files = os.listdir(path)
-    files = [f for f in all_files if '_'.join(f.split("_")[:-1]) in label_map.file.values and (int(f.split(".")[0].split("_")[-1]) == n_eig)]
-    # files = [
-    #     f.split("_")[0] for f in all_files if f.split("_")[0] in label_map.file.values
-    # ]
+    files = [f for f in all_files if '_'.join(f.split("_")[:-1]) in label_map.Design.values and (int(f.split(".")[0].split("_")[-1]) == n_eig)]
 
     random.seed(seed)
     random.shuffle(files)

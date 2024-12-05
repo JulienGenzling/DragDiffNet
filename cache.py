@@ -1,29 +1,35 @@
 import os
 from multiprocessing import Pool
 from functools import partial
-from potpourri3d import read_mesh
+from trimesh import load_mesh
 from diffusion_utils import save_operators
 from tqdm import tqdm
 import torch
+import numpy as np
 from config import Config
 
 
-def prepopulate_cache_file(obj_file_path: str, cache_dir: str, n_eig: int) -> None:
+def prepopulate_cache_file(mesh_file_path: str, cache_dir: str, n_eig: int) -> None:
     """
-    Pre-populates the cache 1 mesh.
+    Pre-populates the cache for 1 mesh.
 
     Parameters:
-    - obj_file_path (str): Path to the mesh file.
+    - mesh_file_path (str): Path to the mesh file.
     - cache_dir (str): Path to the cache directory.
     - n_eig (int): Number of eigenvalues to use.
     """
 
     # Check if this mesh has been processed with this number of eigenvalues
-    npz_file = obj_file_path.split("/")[-1].split(".")[0] + "_" + str(n_eig) + ".npz"
+    npz_file = mesh_file_path.split("/")[-1].split(".")[0] + "_" + str(n_eig) + ".npz"
     save_path = os.path.join(cache_dir, npz_file)
 
     if not os.path.exists(save_path):
-        verts, faces = read_mesh(obj_file_path)
+        # Load the mesh using trimesh
+        mesh = load_mesh(mesh_file_path, process=False)
+
+        # Extract vertices and faces
+        verts = mesh.vertices
+        faces = mesh.faces
 
         save_operators(torch.tensor(verts), torch.tensor(faces), n_eig, save_path)
 
@@ -49,15 +55,14 @@ def prepopulate_cache(
 
     if use_augmentation:
         all_obj_files = [
-            os.path.join(data_basepath, "meshes_aug", f)
-            for f in os.listdir(os.path.join(data_basepath, "meshes_aug"))
+            os.path.join(data_basepath, "mesh_aug", f)
+            for f in os.listdir(os.path.join(data_basepath, "mesh_aug"))
             if not f.endswith("_aug.obj")
         ]
     else:
         all_obj_files = [
-            os.path.join(data_basepath, "meshes", f)
-            for f in os.listdir(os.path.join(data_basepath, "meshes"))
-            if not f.endswith("_flip.obj")
+            os.path.join(data_basepath, "mesh_resampled", f)
+            for f in os.listdir(os.path.join(data_basepath, "mesh_resampled"))
         ]
 
     worker = partial(prepopulate_cache_file, cache_dir=cache_dir, n_eig=n_eig)

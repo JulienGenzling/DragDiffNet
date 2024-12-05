@@ -26,10 +26,8 @@ for fold in range(Config.n_folds):
     # Create dataloaders
     print("Creating dataloaders...")
     train_dataset = CarMeshDataset(
-        Config.data_basepath,
         fold=fold,
         train=True,
-        n_eig=Config.num_eig,
         device=Config.device,
     )
     train_loader = DataLoader(
@@ -41,10 +39,8 @@ for fold in range(Config.n_folds):
     )
 
     valid_dataset = CarMeshDataset(
-        Config.data_basepath,
         fold=fold,
         train=False,
-        n_eig=Config.num_eig,
         device=Config.device,
     )
     valid_loader = DataLoader(
